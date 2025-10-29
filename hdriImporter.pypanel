@@ -1,0 +1,639 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <!-- This file contains definitions of Python interfaces and the
+ interfaces menu.  It should not be hand-edited when it is being
+ used by the application.  Note, that two definitions of the
+ same interface or of the interfaces menu are not allowed
+ in a single file. -->
+  <interface name="hdriImporter" label="HDRI Importer" icon="MISC_python" showNetworkNavigationBar="false" help_url="">
+    <script><![CDATA[########################################################################
+# Author : Junyi Wu  
+# Linkedin: https://www.linkedin.com/in/wujunyiwu/
+# Github: https://github.com/junyiwuu
+# Date: 10/29/2025 
+#
+########################################################################
+
+from hutil.PySide import QtCore, QtUiTools, QtWidgets, QtGui
+import hou
+import os
+import sys
+import math
+import hashlib
+import traceback
+import concurrent.futures
+import OpenImageIO as oiio
+from pxr import Usd, Sdf
+
+
+thumb_w = 512  # thumbnail on disk size
+MAX_WORKERS = 1
+
+mainWidget = None
+table = None
+executor = None
+dispatcher = None
+padding = 16
+cached_keys = {}   # key: hash, item: fullpath
+cell_w = 256
+cell_h = 128
+resize_watcher = None
+resize_timer = None  # it is a QTimer()
+table_row = 1
+table_col = 1
+Drag_active = False
+path_to_widget = {}  # not using row and col (resize will messed up async), use hash map to store loaded data
+current_tableVer = 0   # everytime when table changed(the col and row change), accumulate one, so async can compare, make sure using the latest table version
+jpg_to_hdri = {} # use getJPGpath to  hdri->jpg  , so store to enable reverse way
+processing_set = set()  # the hdri that still processing (on the queue). use the key here!?
+
+
+
+class PanelResizeWatcher(QtCore.QObject):
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.Resize:
+            if resize_timer is None:  # avoid start timer when it is not initialized, just in case
+                return False  
+            resize_timer.start(100)  # 100ms
+        return False
+
+
+def onViewportResized():
+    global current_tableVer
+    # update columns for the current panel width
+    if updateTableSize(cached_keys):
+        current_tableVer+=1
+        fillInTable(cached_keys)  
+
+def sliderThumbSize():
+    # slider update the cell size
+    global cell_w, cell_h
+    cell_w, cell_h = calDisplaySize()
+    # recalculate the table columns, since cell size changed here
+    updateTableSize(cached_keys)
+    fillInTable(cached_keys)
+    
+    # resize the cell
+    w = table.horizontalHeader()
+    h = table.verticalHeader()
+    w.setSectionResizeMode(QtWidgets.QHeaderView.Fixed )
+    h.setSectionResizeMode(QtWidgets.QHeaderView.Fixed )
+    w.setDefaultSectionSize(cell_w)
+    h.setDefaultSectionSize(cell_h)
+    
+    # also resize the thumbnail
+    for row in range(table.rowCount()):
+        for col in range(table.columnCount()):
+            cell = table.cellWidget(row, col)
+            if not cell:
+                continue
+            jpg_path = getJPGpath(cell.hdr_path)
+            if cell and os.path.exists(jpg_path):
+                cell.thumb.setPixmap(
+                    QtGui.QPixmap(jpg_path).scaled(
+                cell_w-padding, cell_h-padding*2, 
+                QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+                    )
+
+def btnSelectPath():
+    global current_tableVer, processing_set
+    
+    hdri_dir = mainWidget.input_path.text()
+    
+    selectedPath = hou.ui.selectFile(start_directory = hdri_dir, 
+                                     title="Choose the directory", 
+                                     file_type = hou.fileType.Directory)
+    
+    
+    if selectedPath:
+        mainWidget.input_path.setText(selectedPath)
+        
+        global cached_keys
+        selectedPath = hou.text.expandString(selectedPath)
+        cached_keys = generateCachedKeys(selectedPath)
+        
+        current_tableVer += 1
+        processing_set.clear()
+        
+        updateTableSize(cached_keys)
+        fillInTable(cached_keys)
+
+
+
+
+def findNetworkEditor():   
+    # select the panel that user triggered
+    desktop = hou.ui.curDesktop()
+    paneTab = None
+    # first try to get the pane tabe under the cursor
+    pane = hou.ui.paneTabUnderCursor()
+    if pane and pane.type() == hou.paneTabType.NetworkEditor:
+        paneTab = pane
+    else:
+        paneTab = desktop.paneTabOfType(hou.paneTabType.NetworkEditor)
+    network_root = paneTab.pwd()
+    network_name = network_root.childTypeCategory().name()
+    return network_root, network_name
+
+    
+        
+def createEnvNodes(network_root, network_name, hdri_path: list, cursorPos=None):
+    '''
+    create env node based on which editor we are in
+    '''
+    for idx , path in enumerate(hdri_path):
+        # lop
+        if network_name == "Lop":
+            node = network_root.createNode("domelight")
+            node.parm(hou.text.encode("inputs:texture:file")).set(path)
+
+        # if no panel, fallback to create in obj
+        else:
+            network_root = hou.node("/obj")
+            node = network_root.createNode("envlight")
+            node.parm("env_map").set(path)
+            
+        if cursorPos is not None:
+            node.setPosition(cursorPos)
+        else:            
+            node.moveToGoodPosition()
+        
+        node.setSelected(True, clear_all_selected=True)
+        
+    
+
+    
+def btnImport():
+    network_root, network_name = findNetworkEditor()
+    
+    selected_items = table.selectedItems()
+    hdri_path = []
+    for item in selected_items:
+        filepath = item.data(QtCore.Qt.UserRole)
+        hdri_path.append(filepath)
+    
+    createEnvNodes(network_root, network_name, hdri_path)
+    
+
+            
+       
+def btnRefresh():
+    '''
+    1. compare old key and new key, dont touch the intersected part
+        delete the extra part from old key
+        add the thumbnail from the new key
+    2. if the thumbnail is missing, throw to the scheduler to generate one
+    '''
+    global cached_keys
+    
+    hdri_dir = mainWidget.input_path.text()
+    hdri_dir = hou.text.expandString(hdri_dir)
+    new_cache = generateCachedKeys(hdri_dir)
+    
+    # find intersection
+    old_cache_keys = set(cached_keys.keys())
+    new_cache_keys = set(new_cache.keys())
+    
+    intersected = old_cache_keys & new_cache_keys
+    delete_keys = old_cache_keys - intersected
+    new_keys = new_cache_keys - intersected
+    
+    # delete the files
+    for key in delete_keys:
+        hdri_path = cached_keys[key]
+        jpg_path = getJPGpath(hdri_path)
+        if os.path.exists(jpg_path):
+            os.remove(jpg_path)
+            
+    # update the cached keys with thew new one
+    cached_keys = new_cache
+    fillInTable(cached_keys)
+    updateTableSize(cached_keys)
+        
+        
+    
+def getJPGpath(hdri_path: str)->str:
+    '''
+    return the full path of jpg version of hdri
+    '''
+    dir_path = os.path.join(os.path.dirname(hdri_path), "Thumbnails")
+    filename = ((os.path.basename(hdri_path)).split('.'))[:-1]
+    filename = '.'.join(filename) + '.jpg'
+    return os.path.join(dir_path, filename)
+    
+    
+          
+        
+def scheduler(src_path: str, cache_key):
+    global executor
+    global dispatcher
+    
+    # make sure we have executor
+    if executor is None:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)                               # Junyi
+        # executor = concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS)
+            
+    # make the thumbnail folder
+    dir_path = os.path.join(os.path.dirname(src_path), "Thumbnails")
+    if not os.path.isdir(dir_path):
+        os.makedirs(dir_path)
+    # define jpg path
+    jpg_path = getJPGpath(src_path)
+    
+    # if thumbnail already exist, return             
+    if os.path.exists(jpg_path):
+        dispatcher.thumbReady.emit(jpg_path, current_tableVer)
+        return 
+    
+    # submit work
+    def work():
+        # generate thumbnal
+        tableVer = current_tableVer
+        generate_thumbnail(src_path, jpg_path)
+        return jpg_path, tableVer
+    
+    def done_callback(future: concurrent.futures): 
+        try:
+            output_jpg_path, tableVer = future.result()
+            # send qt signal from dispather, to update ui
+            dispatcher.thumbReady.emit(output_jpg_path, tableVer)
+            processing_set.discard(cache_key)
+        except Exception:
+            traceback.print_exc()
+            
+            
+    if cache_key not in processing_set:
+        processing_set.add(cache_key)
+        future = executor.submit(work)
+    
+        # callback when work is done
+        future.add_done_callback(done_callback)
+
+        
+    
+    
+
+def generate_thumbnail(src_path: str, dst_path:str, w=thumb_w):
+    '''
+    Read exr hdr, tone mapping, resize, write out as jpg files
+    ''' 
+    buf = oiio.ImageBuf(src_path)
+    if buf.has_error:
+        raise RuntimeError(f"failed to open {src_path}")
+
+    img_channels = buf.nchannels    
+    # #tone mapping
+    buf_tonemap = tonemapping(buf)
+    
+    src_aspectRatio = buf.spec().width / buf.spec().height
+    h = int(w / src_aspectRatio)
+    
+    # resize
+    roi = oiio.ROI(0, w, 0, h, 0, 1, 0, img_channels)
+    buf_resized = oiio.ImageBufAlgo.resize(buf_tonemap, roi=roi)
+    
+    # clamp (this return bool)
+    oiio.ImageBufAlgo.clamp(buf_resized, buf_resized, 0.0, 1.0)
+    
+    #write out
+    # https://openimageio.readthedocs.io/en/latest/pythonbindings.html#ImageBuf.nmiplevels 
+    if not buf_resized.has_error:
+        buf_resized.write(dst_path, dtype=oiio.UINT8)
+    else:
+        print(f"error writing: {dst_path}")
+  # image buffer automatically destroyed
+    
+  
+  
+# https://en.wikipedia.org/wiki/Tone_mapping
+def tonemapping(imgBuf, exposure=0.0, gamma: int=2.2):
+    if exposure!=0.0:
+        imgBuf = oiio.ImageBufAlgo.mul(imgBuf, 2**exposure)
+       
+    # tone map filter
+    one = oiio.ImageBufAlgo.fill((1.0,)*imgBuf.nchannels, roi=imgBuf.roi)
+    denom = oiio.ImageBufAlgo.add(imgBuf, one)
+    out = oiio.ImageBufAlgo.div(imgBuf, denom)
+    
+    # gamma correct
+    buf_gamma = oiio.ImageBufAlgo.pow(out, 1.0/gamma)
+    return buf_gamma    
+        
+        
+    
+    
+class ThumbDispatcher(QtCore.QObject):
+    # the purpose is change the ui immediately
+    thumbReady = QtCore.Signal(str, int)
+    
+# dont use col and row, after async return, table might already changed
+def onThumbReady(jpg_path: str, tableVer: int):
+    if current_tableVer != tableVer:
+        return    # when the outdated async finish computing, then ignore it
+    
+    try:
+        hdri_path = jpg_to_hdri[jpg_path]
+        cell = path_to_widget[hdri_path]
+        if isinstance(cell, QtWidgets.QWidget) and os.path.exists(jpg_path):
+            cell.thumb.setPixmap(QtGui.QPixmap(jpg_path).scaled(
+                cell_w-padding, cell_h-padding*2, 
+                QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation
+            ))
+    except Exception:
+        traceback.print_exc()
+        
+    
+
+
+    
+def calDisplaySize():
+    min_width = 64
+    max_width = 1024
+
+    slider_value = mainWidget.slider_thumbSize.value()  if mainWidget else 30
+    width = min_width + (max_width - min_width)*(slider_value* 0.01)
+    cell_w = int(width + padding)
+    cell_h = int(width * 0.5 + padding * 2)
+    return cell_w, cell_h
+                    
+def updateTableSize(current_cache: dict, forceUpdate= False):
+    global cell_w, cell_h, table_row, table_col, current_tableVer
+    # auto adjust columns if resize houdini python panel
+    viewport_width = table.viewport().width()  # get current panel size
+    cell_w, cell_h = calDisplaySize()
+    n = len(cached_keys)
+    
+    new_table_col = min(max(1, viewport_width//max(1, cell_w)), len(current_cache))
+    new_table_row = 0 if n==0 else math.ceil(n / new_table_col)
+    changed = forceUpdate or (new_table_col!=table_col) or (new_table_row!=table_row)
+    if changed:
+        table_col = new_table_col
+        table_row = new_table_row
+        table.clearContents()
+        table.setColumnCount(table_col)
+        table.setRowCount(table_row)
+        current_tableVer += 1
+        
+    return changed
+    
+    
+def fillInTable(current_cache: dict):
+    '''
+    Based on the current cached key (dict)
+    This function updating 
+        auto adjust columns if resize houdini python panel
+    '''
+    global processing_set
+    
+    table.clearContents()
+    # fill in cells 
+    for idx, (cKey, hdri_path) in enumerate(current_cache.items()):
+        if table_col==0:
+            # row_idx, col_idx = 0
+            return
+        else:            
+            row_idx = idx // table_col
+            col_idx = idx % table_col
+        
+        cell = createTableCell(hdri_path)
+        table.setCellWidget(row_idx, col_idx, cell)
+        # store the relationship in the hashmap
+        jpg_path = getJPGpath(hdri_path)
+        path_to_widget[hdri_path] = cell
+        jpg_to_hdri[jpg_path] = hdri_path
+        
+        # install the hdr path data inside qitem
+        item = QtWidgets.QTableWidgetItem()
+        item.setData(QtCore.Qt.UserRole, hdri_path)
+        table.setItem(row_idx, col_idx, item)        
+        
+        # throw to generate thumbnail
+        scheduler(hdri_path,cKey)
+        
+# QTableWidgetItem is storing data    
+# QWidget is for visual thing        
+
+ 
+def createTableCell(hdr_path):
+    return tableCell(hdr_path)
+ 
+
+class tableCell(QtWidgets.QWidget):
+    def __init__(self, hdr_path, parent = None):
+        super().__init__(parent)
+        self.hdr_path = hdr_path
+        self.setAttribute(QtCore.Qt.WA_Hover)
+        self.press_pos = None
+        
+        # make the layout
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setAlignment(QtCore.Qt.AlignHCenter)
+        layout.setContentsMargins(2, 2, 2, 2)
+        
+        # thumbnail label
+        self.thumb = QtWidgets.QLabel()
+        self.thumb.setAlignment(QtCore.Qt.AlignCenter)
+        self.thumb.setScaledContents(True)
+        self.thumb.setPixmap(QtGui.QPixmap())
+        
+        # filenmae lable
+        filename = os.path.basename(hdr_path)
+        label = QtWidgets.QLabel(filename)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        label.setWordWrap(True)
+
+        layout.addWidget(self.thumb)
+        layout.addWidget(label)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.press_pos = event.pos()
+        super().mousePressEvent(event)
+        
+
+    def mouseMoveEvent(self, event):
+        global Drag_active
+        if not (event.buttons() & QtCore.Qt.LeftButton) or self.press_pos is None:
+            return super().mouseMoveEvent(event)
+        if (event.pos() - self.press_pos).manhattanLength() < QtWidgets.QApplication.startDragDistance(): # start drag distance is the qt system setting for minimum pixels to move (prevent accidental drags)
+            return 
+
+        Drag_active = True
+        
+        drag = QtGui.QDrag(self)
+        mime = QtCore.QMimeData()  # holds the actual data being dragged (Multipurpose Internet Mail Extensions)
+        
+        mime.setText(self.hdr_path)
+        mime.setData("xxxxx", self.hdr_path.encode("utf-8"))  # "xxxxx" is customized format, to make sure
+        drag.setMimeData(mime)
+        
+        # debug
+        # print("mime format:", mime.formats())
+        # print("mime data:", bytes(mime.data("xxxxx")).decode("utf-8"))
+        
+        try:
+            drag.exec_(QtCore.Qt.CopyAction)
+        finally:
+            Drag_active = False
+            self.press_pos = None
+            
+    
+    def mouseReleaseEvent(self, event):
+        self.press_pos = None
+        super().mouseReleaseEvent(event)
+        
+
+
+
+################################################# 
+ #########    Drag and Drop  ############
+ #######################################
+ 
+
+ 
+# # drag is manually initialized, only drop need to be watched
+class DropWatcher(QtCore.QObject):
+   
+    def eventFilter(self, watched, event):
+        global Drag_active
+        
+        # QtCore.QEvent.MouseButtonRelease
+        if event.type() != QtCore.QEvent.Drop :
+            return False
+    
+        mime = event.mimeData()
+        pane = hou.ui.paneTabUnderCursor()
+        paneType = pane.type()
+        
+        # check if it is network editor
+        if paneType == hou.paneTabType.NetworkEditor and mime.hasFormat("xxxxx"):
+            cursor_pos = pane.cursorPosition()    # from which class it has this function?
+            filepaths = [bytes(mime.data("xxxxx")).decode("utf-8")]
+            network_root, network_name = findNetworkEditor()
+            try: 
+                createEnvNodes(network_root, network_name, filepaths, cursorPos=cursor_pos)
+            finally:
+                Drag_active = False
+            return True
+              # safety check if it is our data
+        
+        elif paneType == hou.paneTabType.Parm:
+            Drag_active = False
+            return False
+        
+        
+        return False
+
+               
+        
+        
+
+                  
+        
+
+        
+def generateCachedKeys(dir_path: str):
+    cache = {}
+    if os.path.isdir(dir_path):
+        for file in os.listdir(dir_path):
+            ext = file.split('.')[-1].lower()
+            if ext == 'hdr' or ext == 'exr':
+                fullpath = dir_path + '/' + file
+                cache[cache_key(fullpath)] = fullpath
+    return cache
+    
+    
+# Tools
+def cache_key(src_path: str)->str:
+    '''
+    generate key based on filename + modified time + target size
+    if same name but updated, will also trigger this
+    '''
+    try:
+        # os.stat to grab the metadata
+        metadata = os.stat(src_path)
+        signature = f"{os.path.basename(src_path)}|{int(metadata.st_mtime)}"
+    except Exception:
+        signature = f"{os.path.basename(src_path)}|0"
+    return hashlib.md5(signature.encode("utf-8")).hexdigest()
+          
+
+def onCreateInterface():
+    global mainWidget
+    global table
+    global dispatcher
+    global cached_keys
+    global resize_watcher, resize_timer
+    global MAX_WORKERS
+    
+    MAX_WORKERS = max(2, os.cpu_count()-2)
+    
+    # load the layout
+    scr_dir = hou.text.expandString("$HOUDINI_USER_PREF_DIR/python_panels")
+    ui_filepath = os.path.join(scr_dir, "hdriImporter.ui")
+    
+    loader = QtUiTools.QUiLoader()
+    
+    ui_file = QtCore.QFile(ui_filepath)
+    ui_file.open(QtCore.QFile.ReadOnly)
+    
+    mainWidget = loader.load(ui_file)
+    table       = mainWidget.findChild(QtWidgets.QTableWidget, "widget_hdri")
+    # btn_select  = mainWidget.findChild(QtWidgets.QToolButton, "btn_selectPath")
+    btn_import  = mainWidget.findChild(QtWidgets.QPushButton, "btn_import")
+    btn_import.clicked.connect(btnImport)
+
+    hdri_dir = mainWidget.input_path.text()
+    hdri_dir = hou.text.expandString(hdri_dir)  # make sure it is not relative path
+    
+    cached_keys = generateCachedKeys(hdri_dir)
+    
+    # create dispatcher
+    dispatcher = ThumbDispatcher()
+    dispatcher.thumbReady.connect(onThumbReady)
+    # binding
+    mainWidget.btn_selectPath.clicked.connect(btnSelectPath)
+    # mainWidget.btn_import.clicked.connect(btnImport)
+    mainWidget.btn_refresh.clicked.connect(btnRefresh)
+    mainWidget.slider_thumbSize.setValue(30)
+    mainWidget.slider_thumbSize.valueChanged.connect(sliderThumbSize)
+    
+    # initialize
+
+    updateTableSize(cached_keys)    
+    fillInTable(cached_keys)
+    sliderThumbSize() # initial update the cell size
+        
+    # listenining resize 
+    resize_watcher = PanelResizeWatcher()
+    resize_timer = QtCore.QTimer()
+    resize_timer.setSingleShot(True)
+    resize_timer.timeout.connect(onViewportResized)
+    
+    # register resize watcher
+    table.viewport().installEventFilter(resize_watcher)
+
+    # register drop watcher
+    mainWidget.dropWatcher = DropWatcher()
+    app = QtWidgets.QApplication.instance()
+    app.installEventFilter(mainWidget.dropWatcher)
+    
+    # table disable ui decos
+    table.setShowGrid(False)
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setVisible(False)
+    
+    return mainWidget
+    
+    
+
+
+def onCloseInterface():
+    global executor
+    if executor:
+        executor.shutdown(wait=False)
+        executor = None]]></script>
+    <includeInToolbarMenu menu_position="203" create_separator="false"/>
+    <help><![CDATA[]]></help>
+  </interface>
+</pythonPanelDocument>
