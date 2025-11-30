@@ -9,4 +9,8 @@ https://github.com/user-attachments/assets/e982315e-1f68-445e-ae87-ef25f9395eb3
 2. Open Houdini -> Pane Tab Type -> Misc -> Python Panel -> should showing in the drop down menu on the left top
 
 
+**Notes:**
+
+The UI and idea are inspired by Adrien Lambert’s [tutorial](https://adrienlambert.gumroad.com/l/pythfx) screenshot: https://public-files.gumroad.com/qwi7g0w0e4lf25qyrm52cbq25dxw
+The code is my own-made since I don’t have access to the tutorial.
 
